@@ -1,326 +1,157 @@
 """
-KDSH 2026 Track A - Narrative Consistency RAG System
-Author: Hackathon Participant
-Date: January 2026
+KDSH 2026 Track A – Narrative Consistency RAG (NVIDIA NIM Edition)
+Transitioned from OpenAI to NVIDIA AI Foundation Endpoints.
 """
 
 import os
 import json
 import csv
-import re
-import logging
 import time
+import pickle
+import logging
+import numpy as np
+import pandas as pd
 from pathlib import Path
-from typing import Dict, List
+from typing import List, Dict
 from dataclasses import dataclass
 
-import pandas as pd
+import nltk
+from nltk.tokenize import sent_tokenize
+from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
+
+# Use the NVIDIA LangChain integration or standard OpenAI-compatible client
 from openai import OpenAI
 
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# --- Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing")
 
-client = OpenAI(api_key=API_KEY)
-
-# ---------------------------------------------------------------------
-# Data Structure
-# ---------------------------------------------------------------------
+# NVIDIA NIMs are OpenAI-API compatible! 
+# You just change the base_url and use your NVIDIA API Key.
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY
+)
 
 @dataclass
-class ConsistencyResult:
-    id: str
-    book_char: str
-    content: str
-    caption: str
-    prediction: int
-    confidence: float
-    rationale: str
+class Chunk:
+    text: str
+    embedding: np.ndarray
+    kind: str 
 
-# ---------------------------------------------------------------------
-# RAG SYSTEM
-# ---------------------------------------------------------------------
-
-class KDSHNarrativeConsistencyRAG:
-
-    def __init__(self, books_dir="./books", training_csv="train.csv"):
+# --- RAG Core ---
+class NarrativeConsistencyRAG:
+    def __init__(self, books_dir="./books", csv_path="train.csv", index_path="nvidia_narrative_index.pkl"):
         self.books_dir = Path(books_dir)
-        self.training_csv = Path(training_csv)
-        self.narratives: Dict[str, str] = {}
+        self.csv_path = Path(csv_path)
+        self.index_path = Path(index_path)
+        self.corpus: Dict[str, List[Chunk]] = {}
 
-        logger.info("Initialized KDSH Narrative Consistency RAG")
-        logger.info(f"Books dir: {self.books_dir}")
-        logger.info(f"CSV file: {self.training_csv}")
-
-    # -----------------------------------------------------------------
-    # Loading
-    # -----------------------------------------------------------------
-
-    def load_books(self) -> Dict[str, str]:
-        if not self.books_dir.exists():
-            logger.warning("Books directory not found")
-            return {}
-
-        for f in self.books_dir.glob("*.txt"):
-            key = f.stem.lower()
-            self.narratives[key] = f.read_text(encoding="utf-8", errors="ignore")
-            logger.info(f"Loaded book: {f.stem}")
-
-        return self.narratives
-
-    def load_training_data(self) -> pd.DataFrame:
-        if not self.training_csv.exists():
-            raise FileNotFoundError("Training CSV not found")
-        df = pd.read_csv(self.training_csv)
-        logger.info(f"Loaded {len(df)} training rows")
-        return df
-
-    # -----------------------------------------------------------------
-    # Utilities
-    # -----------------------------------------------------------------
-
-    def extract_book_name(self, book_char: str) -> str:
-        return book_char.split("×")[0].strip() if "×" in book_char else book_char.strip()
-
-    def chunk_text(self, text: str, size: int = 400) -> List[str]:
-        words = text.split()
-        return [
-            " ".join(words[i:i + size])
-            for i in range(0, len(words), size)
-            if len(words[i:i + size]) > 50
-        ]
-
-    # -----------------------------------------------------------------
-    # Retrieval
-    # -----------------------------------------------------------------
-
-    def retrieve(self, narrative: str, query: str, k: int = 3):
-        chunks = self.chunk_text(narrative)
-        q_words = set(query.lower().split())
-        scored = []
-
-        for c in chunks:
-            overlap = len(q_words & set(c.lower().split()))
-            if overlap > 0:
-                scored.append((c, overlap / max(len(q_words), 1)))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:k]
-
-    # -----------------------------------------------------------------
-    # Reasoning
-    # -----------------------------------------------------------------
-
-    def reason(self, book, character, content, caption, narrative):
-        evidence = self.retrieve(narrative, content + " " + caption)
-
-        if not evidence:
-            return 0, 0.3, "No relevant narrative evidence found"
-
-        evidence_text = "\n\n".join(
-            f"Section {i+1}:\n{sec[:300]}..."
-            for i, (sec, _) in enumerate(evidence)
+    def embed(self, texts: List[str]) -> np.ndarray:
+        """Fetch embeddings from NVIDIA's NV-Embed-QA model."""
+        # Using NVIDIA's retrieval-optimized embedding model
+        response = client.embeddings.create(
+            input=texts,
+            model="nvidia/nv-embedqa-e5-v5", # One of NVIDIA's best embedding models
+            extra_body={"input_type": "query"}
         )
+        return np.array([e.embedding for e in response.data])
 
-        prompt = f"""
-You are a narrative consistency judge.
+    def chunk_text(self, text: str) -> List[str]:
+        sentences = sent_tokenize(text)
+        chunks, buf = [], []
+        for s in sentences:
+            buf.append(s)
+            if len(" ".join(buf).split()) > 180:
+                chunks.append(" ".join(buf))
+                buf = []
+        if buf: chunks.append(" ".join(buf))
+        return chunks
 
-BOOK: {book}
-CHARACTER: {character}
+    def classify_kind(self, chunk: str) -> str:
+        triggers = ["never", "always", "habit", "trait", "hated", "fears", "childhood", "forbidden"]
+        return "backstory" if any(t in chunk.lower() for t in triggers) else "event"
 
-CONTENT:
-"{content}"
+    def build_or_load(self):
+        if self.index_path.exists():
+            with open(self.index_path, "rb") as f:
+                self.corpus = pickle.load(f)
+            logger.info("Loaded cached NVIDIA index.")
+        else:
+            logger.info("Building NVIDIA index...")
+            for f in self.books_dir.glob("*.txt"):
+                book_key = f.stem.lower()
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                txt_chunks = self.chunk_text(text)
+                
+                # NVIDIA NIMs usually have high rate limits, 
+                # but batching is still better.
+                embeddings = self.embed(txt_chunks)
+                kinds = [self.classify_kind(c) for c in txt_chunks]
+                
+                self.corpus[book_key] = [
+                    Chunk(text=c, embedding=e, kind=k)
+                    for c, e, k in zip(txt_chunks, embeddings, kinds)
+                ]
+                logger.info(f"Indexed: {book_key}")
+            
+            with open(self.index_path, "wb") as f:
+                pickle.dump(self.corpus, f)
 
-CAPTION:
-"{caption}"
+    def retrieve_and_rerank(self, book_key: str, character: str, query: str, k=3):
+        search_query = f"Retrieve narrative evidence for: {character} - {query}"
+        q_emb = self.embed([search_query])[0]
+        
+        chunks = self.corpus.get(book_key, [])
+        if not chunks: return [], [], True
 
-NARRATIVE EVIDENCE:
-{evidence_text}
+        emb_matrix = np.stack([c.embedding for c in chunks])
+        sims = cosine_similarity([q_emb], emb_matrix)[0]
+        
+        top_indices = np.argsort(sims)[-15:][::-1]
+        candidates = [chunks[i] for i in top_indices]
+        candidate_sims = [sims[i] for i in top_indices]
 
-Respond ONLY in JSON:
-{{
-  "consistent": true/false,
-  "confidence": 0.5-1.0,
-  "reasoning": "short explanation"
-}}
-"""
+        events = [c.text for c, s in zip(candidates, candidate_sims) if c.kind == "event" and s > 0.22][:k]
+        backstory = [c.text for c, s in zip(candidates, candidate_sims) if c.kind == "backstory" and s > 0.18][:k]
+        
+        return events, backstory, (max(sims) < 0.25)
 
+    def judge(self, book, content, caption, events, backstory, absence):
+        prompt = f"Book: {book}\nStatement: {content}\nEvents: {events}\nBackstory: {backstory}\nAbsence: {absence}"
+        
+        # Using Llama-3-70b-Instruct via NVIDIA NIM
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=250,
-                timeout=30
+            r = client.chat.completions.create(
+                model="meta/llama3-70b-instruct", 
+                messages=[{"role": "system", "content": "Return ONLY JSON with 'consistent' (bool), 'confidence' (float), and 'reasoning' (str)."},
+                          {"role": "user", "content": prompt}],
+                temperature=0.1
             )
-
-            text = response.choices[0].message.content.strip()
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-
-            if not match:
-                return 0, 0.5, "Malformed model output"
-
-            data = json.loads(match.group())
-            return (
-                1 if data.get("consistent") else 0,
-                float(data.get("confidence", 0.5)),
-                data.get("reasoning", "")
-            )
-
+            res = json.loads(r.choices[0].message.content)
+            return (1 if res["consistent"] else 0, float(res["confidence"]), res["reasoning"])
         except Exception as e:
-            logger.error(f"LLM failure: {e}")
-            return 0, 0.25, "LLM error / timeout"
+            logger.error(f"Judging Error: {e}")
+            return (0, 0.5, "NVIDIA NIM processing error")
 
-    # -----------------------------------------------------------------
-    # Row Processing
-    # -----------------------------------------------------------------
-
-    def process_row(self, row: pd.Series) -> ConsistencyResult:
-        book_char = str(row["book_name"])
-        content = str(row["content"])
-        caption = str(row.get("caption", ""))
-
-        book = self.extract_book_name(book_char)
-        narrative = self.narratives.get(book.lower(), "")
-
-        if not narrative:
-            return ConsistencyResult(
-                id=str(row["id"]),
-                book_char=book_char,
-                content=content,
-                caption=caption,
-                prediction=0,
-                confidence=0.2,
-                rationale="Narrative not found"
-            )
-
-        pred, conf, reason = self.reason(
-            book, book_char, content, caption, narrative
-        )
-
-        return ConsistencyResult(
-            id=str(row["id"]),
-            book_char=book_char,
-            content=content,
-            caption=caption,
-            prediction=pred,
-            confidence=conf,
-            rationale=reason
-        )
-
-    # -----------------------------------------------------------------
-    # Batch Mode (INCREMENTAL CSV)
-    # -----------------------------------------------------------------
-
-    def batch_process(self, output_csv="results.csv"):
-        self.load_books()
-        df = self.load_training_data()
-
-        output_path = Path(output_csv)
-        file_exists = output_path.exists()
-
-        with open(output_path, "a", newline="", encoding="utf-8") as f:
+    def run_pipeline(self, output_file="results.csv"):
+        self.build_or_load()
+        df = pd.read_csv(self.csv_path)
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-
-            if not file_exists:
-                writer.writerow([
-                    "id",
-                    "book_name",
-                    "content",
-                    "caption",
-                    "prediction",
-                    "confidence",
-                    "rationale"
-                ])
+            writer.writerow(["id", "prediction", "confidence", "rationale"])
+            for _, row in df.iterrows():
+                parts = row["book_name"].split("×")
+                book_key, char_name = parts[0].strip().lower(), (parts[1].strip() if len(parts) > 1 else "Character")
+                ev, bk, ab = self.retrieve_and_rerank(book_key, char_name, str(row["content"]))
+                pred, conf, reason = self.judge(book_key, row["content"], row.get("caption", ""), ev, bk, ab)
+                writer.writerow([row["id"], pred, f"{conf:.2f}", reason])
                 f.flush()
 
-            for _, row in df.iterrows():
-                row_id = row["id"]
-                logger.info(f"Processing row {row_id}")
-
-                try:
-                    result = self.process_row(row)
-
-                    writer.writerow([
-                        result.id,
-                        result.book_char,
-                        result.content[:200],
-                        result.caption[:200],
-                        result.prediction,
-                        f"{result.confidence:.2f}",
-                        result.rationale[:200]
-                    ])
-                    f.flush()
-
-                    logger.info(
-                        f"Saved row {row_id} | pred={result.prediction} | conf={result.confidence:.2f}"
-                    )
-
-                except Exception as e:
-                    logger.error(f"Failed row {row_id}: {e}")
-
-                time.sleep(1.2)  # rate-limit safe
-
-        logger.info("Batch processing complete")
-
-    # -----------------------------------------------------------------
-    # Interactive Mode
-    # -----------------------------------------------------------------
-
-    def interactive(self):
-        self.load_books()
-        df = self.load_training_data()
-
-        print("\nInteractive Mode (process <id> | quit)\n")
-
-        while True:
-            cmd = input(">> ").strip()
-            if cmd == "quit":
-                break
-
-            if cmd.startswith("process"):
-                rid = int(cmd.split()[1])
-                row = df[df["id"] == rid].iloc[0]
-                res = self.process_row(row)
-
-                print("\nRESULT")
-                print("Prediction:", "CONSISTENT" if res.prediction else "CONTRADICT")
-                print("Confidence:", res.confidence)
-                print("Reason:", res.rationale)
-                print()
-
-# ---------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["batch", "interactive"], default="batch")
-    parser.add_argument("--books-dir", default="./books")
-    parser.add_argument("--csv", default="train.csv")
-    parser.add_argument("--output", default="results.csv")
-    args = parser.parse_args()
-
-    rag = KDSHNarrativeConsistencyRAG(args.books_dir, args.csv)
-
-    if args.mode == "batch":
-        rag.batch_process(args.output)
-    else:
-        rag.interactive()
-
 if __name__ == "__main__":
-    main()
+    rag = NarrativeConsistencyRAG()
+    rag.run_pipeline()
